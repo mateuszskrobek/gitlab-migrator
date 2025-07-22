@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path"
 	"regexp"
 	"slices"
 	"sort"
@@ -31,7 +32,7 @@ import (
 	"github.com/hashicorp/go-cleanhttp"
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/go-retryablehttp"
-	"github.com/xanzy/go-gitlab"
+	gitlab "gitlab.com/gitlab-org/api/client-go"
 )
 
 const (
@@ -42,7 +43,7 @@ const (
 
 var loop, report bool
 var deleteExistingRepos, enablePullRequests, renameMasterToMain bool
-var githubDomain, githubRepo, githubToken, githubUser, gitlabDomain, gitlabProject, gitlabToken, projectsCsvPath string
+var githubDomain, githubRepo, githubToken, githubUser, gitlabDomain, gitlabToken, gitlabProjectId, projectsCsvPath string
 
 var (
 	cache          *objectCache
@@ -52,6 +53,12 @@ var (
 	gl             *gitlab.Client
 	maxConcurrency int
 )
+
+// Add userMapFile and userMap variables
+type userMapType map[string]string
+
+var userMapFile string
+var userMap = userMapType{}
 
 type Project = []string
 
@@ -119,12 +126,33 @@ func main() {
 	flag.StringVar(&githubRepo, "github-repo", "", "the GitHub repository to migrate to")
 	flag.StringVar(&githubUser, "github-user", "", "specifies the GitHub user to use, who will author any migrated PRs (required)")
 	flag.StringVar(&gitlabDomain, "gitlab-domain", defaultGitlabDomain, "specifies the GitLab domain to use")
-	flag.StringVar(&gitlabProject, "gitlab-project", "", "the GitLab project to migrate")
-	flag.StringVar(&projectsCsvPath, "projects-csv", "", "specifies the path to a CSV file describing projects to migrate (incompatible with -gitlab-project and -github-repo)")
+	flag.StringVar(&gitlabProjectId, "project-id", "", "GitLab project ID")
+	flag.StringVar(&projectsCsvPath, "projects-csv", "", "specifies the path to a CSV file describing projects to migrate (incompatible with -project-id and -github-repo)")
+	flag.StringVar(&userMapFile, "usermap", "", "CSV file with gitlab,github username pairs")
 
 	flag.IntVar(&maxConcurrency, "max-concurrency", 4, "how many projects to migrate in parallel")
 
 	flag.Parse()
+
+	// Parse userMapFile if provided
+	if userMapFile != "" {
+		f, err := os.Open(userMapFile)
+		if err != nil {
+			logger.Error("reading user-map", "err", err)
+			os.Exit(1)
+		}
+		r := csv.NewReader(f)
+		for {
+			rec, err := r.Read()
+			if err != nil {
+				break
+			}
+			if len(rec) == 2 {
+				userMap[strings.TrimSpace(rec[0])] = strings.TrimSpace(rec[1])
+			}
+		}
+		_ = f.Close()
+	}
 
 	if githubUser == "" {
 		githubUser = os.Getenv("GITHUB_USER")
@@ -135,13 +163,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	repoSpecifiedInline := githubRepo != "" && gitlabProject != ""
+	repoSpecifiedInline := githubRepo != "" && gitlabProjectId != ""
 	if repoSpecifiedInline && projectsCsvPath != "" {
-		logger.Error("cannot specify -projects-csv and either -github-repo or -gitlab-project at the same time")
+		logger.Error("cannot specify -projects-csv and either -github-repo or -project-id at the same time")
 		os.Exit(1)
 	}
 	if !repoSpecifiedInline && projectsCsvPath == "" {
-		logger.Error("must specify either -projects-csv or both of -github-repo and -gitlab-project")
+		logger.Error("must specify either -projects-csv or both of -github-repo and -project-id")
 		os.Exit(1)
 	}
 
@@ -290,7 +318,7 @@ func main() {
 			os.Exit(1)
 		}
 	} else {
-		projects = []Project{{gitlabProject, githubRepo}}
+		projects = []Project{{gitlabProjectId, githubRepo}}
 	}
 
 	if report {
@@ -341,33 +369,34 @@ func printReport(ctx context.Context, projects []Project) {
 }
 
 func reportProject(ctx context.Context, proj []string) (*Report, error) {
-	gitlabPath := strings.Split(proj[0], "/")
-	//githubPath := strings.Split(proj[1], "/")
+	projectId, err := strconv.Atoi(proj[0])
+	if err != nil {
+		return nil, fmt.Errorf("project ID: %v", err)
+	}
 
-	logger.Debug("searching for GitLab project", "name", gitlabPath[1], "group", gitlabPath[0])
-	searchTerm := gitlabPath[1]
-	projectResult, _, err := gl.Projects.ListProjects(&gitlab.ListProjectsOptions{Search: &searchTerm})
+	logger.Debug("searching for GitLab project", "ID", projectId)
+	projectResult, _, err := gl.Projects.GetProject(projectId, nil)
 	if err != nil {
 		return nil, fmt.Errorf("listing projects: %v", err)
 	}
 
 	var project *gitlab.Project
-	for _, item := range projectResult {
-		if item == nil {
-			continue
-		}
+	var gitlabPath []string
 
-		if item.PathWithNamespace == proj[0] {
-			logger.Debug("found GitLab project", "name", gitlabPath[1], "group", gitlabPath[0], "project_id", item.ID)
-			project = item
+	if projectResult.ID == projectId {
+		gitlabPath := []string{
+			path.Dir(projectResult.PathWithNamespace),
+			path.Base(projectResult.PathWithNamespace),
 		}
+		logger.Debug("found GitLab project", "name", gitlabPath[1], "group", gitlabPath[0], "project_id", projectResult.ID)
+		project = projectResult
 	}
 
 	if project == nil {
 		return nil, fmt.Errorf("no matching GitLab project found: %s", proj[0])
 	}
 
-	var mergeRequests []*gitlab.MergeRequest
+	var mergeRequests []*gitlab.BasicMergeRequest
 
 	opts := &gitlab.ListProjectMergeRequestsOptions{
 		OrderBy: pointer("created_at"),
@@ -457,26 +486,29 @@ func performMigration(ctx context.Context, projects []Project) error {
 }
 
 func migrateProject(ctx context.Context, proj []string) error {
-	gitlabPath := strings.Split(proj[0], "/")
+	projectId, err := strconv.Atoi(proj[0])
+	if err != nil {
+		return fmt.Errorf("project ID: %v", err)
+	}
+
 	githubPath := strings.Split(proj[1], "/")
 
-	logger.Info("searching for GitLab project", "name", gitlabPath[1], "group", gitlabPath[0])
-	searchTerm := gitlabPath[1]
-	projectResult, _, err := gl.Projects.ListProjects(&gitlab.ListProjectsOptions{Search: &searchTerm})
+	logger.Debug("searching for GitLab project", "ID", projectId)
+	projectResult, _, err := gl.Projects.GetProject(projectId, nil)
 	if err != nil {
 		return fmt.Errorf("listing projects: %v", err)
 	}
 
 	var project *gitlab.Project
-	for _, item := range projectResult {
-		if item == nil {
-			continue
-		}
+	var gitlabPath []string
 
-		if item.PathWithNamespace == proj[0] {
-			logger.Debug("found GitLab project", "name", gitlabPath[1], "group", gitlabPath[0], "project_id", item.ID)
-			project = item
+	if projectResult.ID == projectId {
+		gitlabPath = []string{
+			path.Dir(projectResult.PathWithNamespace),
+			path.Base(projectResult.PathWithNamespace),
 		}
+		logger.Debug("found GitLab project", "name", gitlabPath[1], "group", gitlabPath[0], "project_id", projectResult.ID)
+		project = projectResult
 	}
 
 	if project == nil {
@@ -642,7 +674,7 @@ func migrateProject(ctx context.Context, proj []string) error {
 }
 
 func migratePullRequests(ctx context.Context, githubPath, gitlabPath []string, project *gitlab.Project, repo *git.Repository) {
-	var mergeRequests []*gitlab.MergeRequest
+	var mergeRequests []*gitlab.BasicMergeRequest
 
 	opts := &gitlab.ListProjectMergeRequestsOptions{
 		OrderBy: pointer("created_at"),
@@ -684,7 +716,6 @@ func migratePullRequests(ctx context.Context, githubPath, gitlabPath []string, p
 		var pullRequest *github.PullRequest
 
 		logger.Debug("searching for any existing pull request", "owner", githubPath[0], "repo", githubPath[1], "merge_request_id", mergeRequest.IID)
-		//query := fmt.Sprintf("repo:%s/%s is:pr head:%s", githubPath[0], githubPath[1], mergeRequest.SourceBranch)
 		query := fmt.Sprintf("repo:%s/%s is:pr", githubPath[0], githubPath[1])
 		searchResult, err := getGithubSearchResults(ctx, query)
 		if err != nil {
@@ -766,24 +797,39 @@ func migratePullRequests(ctx context.Context, githubPath, gitlabPath []string, p
 					continue
 				}
 
-				// API is buggy, ordering is not respected, so we'll reorder by commit datestamp
-				sort.Slice(mergeRequestCommits, func(i, j int) bool {
-					return mergeRequestCommits[i].CommittedDate.Before(*mergeRequestCommits[j].CommittedDate)
-				})
+				// Check if this is a squashed MR (single or multiple commits)
+				var startCommitSHA, endCommitSHA string
+				if mergeRequest.Squash && mergeRequest.SquashCommitSHA != "" {
+					// For any squashed MR, use the squash commit (handles both single and multiple commits)
+					logger.Trace("using squash commit for squashed merge request", "name", gitlabPath[1], "group", gitlabPath[0], "project_id", project.ID, "merge_request_id", mergeRequest.IID, "squash_commit_sha", mergeRequest.SquashCommitSHA, "original_commits", len(mergeRequestCommits))
 
-				if mergeRequestCommits[0] == nil {
-					sendErr(fmt.Errorf("start commit for merge request %d is nil", mergeRequest.IID))
-					failureCount++
-					continue
-				}
-				if mergeRequestCommits[len(mergeRequestCommits)-1] == nil {
-					sendErr(fmt.Errorf("end commit for merge request %d is nil", mergeRequest.IID))
-					failureCount++
-					continue
+					// For squashed commits, both start and end should be the squash commit
+					startCommitSHA = mergeRequest.SquashCommitSHA
+					endCommitSHA = mergeRequest.SquashCommitSHA
+				} else {
+					// Use existing logic for non-squashed MRs only
+					// API is buggy, ordering is not respected, so we'll reorder by commit datestamp
+					sort.Slice(mergeRequestCommits, func(i, j int) bool {
+						return mergeRequestCommits[i].CommittedDate.Before(*mergeRequestCommits[j].CommittedDate)
+					})
+
+					if mergeRequestCommits[0] == nil {
+						sendErr(fmt.Errorf("start commit for merge request %d is nil", mergeRequest.IID))
+						failureCount++
+						continue
+					}
+					if mergeRequestCommits[len(mergeRequestCommits)-1] == nil {
+						sendErr(fmt.Errorf("end commit for merge request %d is nil", mergeRequest.IID))
+						failureCount++
+						continue
+					}
+
+					startCommitSHA = mergeRequestCommits[0].ID
+					endCommitSHA = mergeRequestCommits[len(mergeRequestCommits)-1].ID
 				}
 
-				logger.Trace("inspecting start commit", "name", gitlabPath[1], "group", gitlabPath[0], "project_id", project.ID, "merge_request_id", mergeRequest.IID, "sha", mergeRequestCommits[0].ShortID)
-				startCommit, err := object.GetCommit(repo.Storer, plumbing.NewHash(mergeRequestCommits[0].ID))
+				logger.Info("inspecting start commit", "name", gitlabPath[1], "group", gitlabPath[0], "project_id", project.ID, "merge_request_id", mergeRequest.IID, "sha", startCommitSHA[:8])
+				startCommit, err := object.GetCommit(repo.Storer, plumbing.NewHash(startCommitSHA))
 				if err != nil {
 					sendErr(fmt.Errorf("loading start commit: %v", err))
 					failureCount++
@@ -829,8 +875,9 @@ func migratePullRequests(ctx context.Context, githubPath, gitlabPath []string, p
 					}
 				}
 
-				endHash := plumbing.NewHash(mergeRequestCommits[len(mergeRequestCommits)-1].ID)
+				endHash := plumbing.NewHash(endCommitSHA)
 				logger.Trace("creating source branch for merged/closed merge request", "name", gitlabPath[1], "group", gitlabPath[0], "project_id", project.ID, "merge_request_id", mergeRequest.IID, "branch", mergeRequest.SourceBranch, "sha", endHash)
+
 				if err = worktree.Checkout(&git.CheckoutOptions{
 					Create: true,
 					Force:  true,
@@ -878,9 +925,8 @@ func migratePullRequests(ctx context.Context, githubPath, gitlabPath []string, p
 			sendErr(fmt.Errorf("retrieving gitlab user: %v", err))
 			failureCount++
 			continue
-		}
-		if author.WebsiteURL != "" {
-			githubAuthorName = "@" + strings.TrimPrefix(strings.ToLower(author.WebsiteURL), "https://github.com/")
+		} else {
+			githubAuthorName = author.Name
 		}
 
 		originalState := ""
@@ -890,31 +936,37 @@ func migratePullRequests(ctx context.Context, githubPath, gitlabPath []string, p
 
 		logger.Debug("determining merge request approvers", "name", gitlabPath[1], "group", gitlabPath[0], "project_id", project.ID, "merge_request_id", mergeRequest.IID)
 		approvers := make([]string, 0)
-		awards, _, err := gl.AwardEmoji.ListMergeRequestAwardEmoji(project.ID, mergeRequest.IID, &gitlab.ListAwardEmojiOptions{PerPage: 100})
+		approvals, _, err := gl.MergeRequests.GetMergeRequestApprovals(project.ID, mergeRequest.IID)
 		if err != nil {
-			sendErr(fmt.Errorf("listing merge request awards: %v", err))
+			sendErr(fmt.Errorf("listing merge request approvals: %v", err))
 		} else {
-			for _, award := range awards {
-				if award.Name == "thumbsup" {
-					approver := award.User.Name
-
-					approverUser, err := getGitlabUser(award.User.Username)
-					if err != nil {
-						sendErr(fmt.Errorf("retrieving gitlab user: %v", err))
-						continue
-					}
-					if approverUser.WebsiteURL != "" {
-						approver = "@" + strings.TrimPrefix(strings.ToLower(approverUser.WebsiteURL), "https://github.com/")
-					}
-
-					approvers = append(approvers, approver)
+			for _, approvedBy := range approvals.ApprovedBy {
+				if approvedBy.User == nil {
+					continue
 				}
+
+				approver := approvedBy.User.Name
+
+				approverUser, err := getGitlabUser(approvedBy.User.Username)
+				if err != nil {
+					sendErr(fmt.Errorf("retrieving gitlab user: %v", err))
+					continue
+				} else {
+					approver = approverUser.Name
+				}
+
+				approvers = append(approvers, approver)
 			}
 		}
 
 		description := mergeRequest.Description
 		if strings.TrimSpace(description) == "" {
 			description = "_No description_"
+		}
+
+		mergeCommitSHA := mergeRequest.MergeCommitSHA
+		if mergeCommitSHA == "" {
+			mergeCommitSHA = "N/A"
 		}
 
 		slices.Sort(approvers)
@@ -941,18 +993,21 @@ func migratePullRequests(ctx context.Context, githubPath, gitlabPath []string, p
 > |      |      |
 > | ---- | ---- |
 > | **Original Author** | %[1]s |
-> | **GitLab Project** | [%[4]s/%[5]s](https://%[10]s/%[4]s/%[5]s) |
-> | **GitLab Merge Request** | [%[11]s](https://%[10]s/%[4]s/%[5]s/merge_requests/%[2]d) |
-> | **GitLab MR Number** | [%[2]d](https://%[10]s/%[4]s/%[5]s/merge_requests/%[2]d) |
-> | **Date Originally Opened** | %[6]s |%[7]s
-> | **Approved on GitLab by** | %[8]s |
+> | **GitLab username** | %[2]s |
+> | **GitLab Project** | [%[5]s/%[6]s](https://%[11]s/%[5]s/%[6]s) |
+> | **GitLab Merge Request** | [%[12]s](https://%[11]s/%[5]s/%[6]s/merge_requests/%[3]d) |
+> | **GitLab MR Number** | [%[3]d](https://%[11]s/%[5]s/%[6]s/merge_requests/%[3]d) |
+> | **Date Originally Opened** | %[7]s |%[8]s
+> | **Approved on GitLab by** | %[9]s |
+> | **State** | %[13]s |
+> | **Merge commit** | %[14]s |
 > |      |      |
 >
-%[9]s
+%[10]s
 
 ## Original Description
 
-%[3]s`, githubAuthorName, mergeRequest.IID, description, gitlabPath[0], gitlabPath[1], mergeRequest.CreatedAt.Format(dateFormat), closeDate, approval, originalState, gitlabDomain, mergeRequestTitle)
+%[4]s`, githubAuthorName, author.Username, mergeRequest.IID, description, gitlabPath[0], gitlabPath[1], mergeRequest.CreatedAt.Format(dateFormat), closeDate, approval, originalState, gitlabDomain, mergeRequestTitle, mergeRequest.State, mergeCommitSHA)
 
 		if pullRequest == nil {
 			logger.Info("creating pull request", "owner", githubPath[0], "repo", githubPath[1], "source_branch", mergeRequest.SourceBranch, "target_branch", mergeRequest.TargetBranch)
@@ -1078,10 +1133,9 @@ func migratePullRequests(ctx context.Context, githubPath, gitlabPath []string, p
 					if err != nil {
 						sendErr(fmt.Errorf("retrieving gitlab user: %v", err))
 						failureCount++
-						break
-					}
-					if commentAuthor.WebsiteURL != "" {
-						githubCommentAuthorName = "@" + strings.TrimPrefix(strings.ToLower(commentAuthor.WebsiteURL), "https://github.com/")
+						continue
+					} else {
+						githubCommentAuthorName = commentAuthor.Name
 					}
 
 					commentBody := fmt.Sprintf(`> [!NOTE]
@@ -1090,14 +1144,15 @@ func migratePullRequests(ctx context.Context, githubPath, gitlabPath []string, p
 > |      |      |
 > | ---- | ---- |
 > | **Original Author** | %[1]s |
-> | **Note ID** | %[2]d |
-> | **Date Originally Created** | %[3]s |
+> | **GitLab username** | %[2]s |
+> | **Note ID** | %[3]d |
+> | **Date Originally Created** | %[4]s |
 > |      |      |
 >
 
 ## Original Comment
 
-%[4]s`, githubCommentAuthorName, comment.ID, comment.CreatedAt.Format("Mon, 2 Jan 2006"), comment.Body)
+%[5]s`, githubCommentAuthorName, commentAuthor.Username, comment.ID, comment.CreatedAt.Format("Mon, 2 Jan 2006"), comment.Body)
 
 					foundExistingComment := false
 					for _, prComment := range prComments {

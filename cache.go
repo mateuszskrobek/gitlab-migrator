@@ -4,7 +4,7 @@ import (
 	"sync"
 
 	"github.com/google/go-github/v69/github"
-	"github.com/xanzy/go-gitlab"
+	gitlab "gitlab.com/gitlab-org/api/client-go"
 )
 
 const (
