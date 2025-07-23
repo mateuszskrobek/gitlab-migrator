@@ -1,5 +1,15 @@
 # GitLab to GitHub Repository Migration Tool
 
+> [!NOTE]
+> It is a fork of [manicminer/gitlab-migrator](https://github.com/manicminer/gitlab-migrator) with some modifications to fit my needs.
+
+#### Changes made in this fork:
+- replace GitLab project name with GitLab project ID - this is useful when the project is under multi-level group and GitLab API does not allow to easily serach by full project path,
+- add GitLab usernames to GitHub usernames mapping for better PR and comment authorship - it allows to show both author name and GitLab & GitHub usernames in migrated PRs and comments,
+- removes support for username mapping from a GitLab profile Web URL due to a new CSV based user mapping,
+- extended Markdown table with more detailed information about the original MRs/comments.
+---
+
 This tool can migrate projects from GitLab to repositories on GitHub. It currently supports:
 
 * migrating the git repository with full history
@@ -25,7 +35,7 @@ Golang 1.23 was used, you may have luck with earlier releases.
 _Example Usage_
 
 ```
-gitlab-migrator -github-user=mytokenuser -gitlab-project=mygitlabuser/myproject -github-repo=mygithubuser/myrepo -migrate-pull-requests
+gitlab-migrator -github-user=mygithubuser -project-id=123456 -github-repo=mygithubuser/myrepo -migrate-pull-requests
 ```
 
 Written in Go, this is a cross-platform CLI utility that accepts the following runtime arguments:
@@ -38,11 +48,11 @@ Written in Go, this is a cross-platform CLI utility that accepts the following r
   -github-repo string
         the GitHub repository to migrate to
   -github-user string
-        specifies the GitHub user to use, who will author any migrated PRs. can also be sourced from GITHUB_USER environment variable (required)
+        specifies the GitHub user to use, who will author any migrated PRs, can also be sourced from GITHUB_USER environment variable (required)
   -gitlab-domain string
         specifies the GitLab domain to use (default "gitlab.com")
-  -gitlab-project string
-        the GitLab project to migrate
+  -project-id string
+        ID of the GitLab project to migrate
   -loop
         continue migrating until canceled
   -max-concurrency int
@@ -50,7 +60,10 @@ Written in Go, this is a cross-platform CLI utility that accepts the following r
   -migrate-pull-requests
         whether pull requests should be migrated
   -projects-csv string
-        specifies the path to a CSV file describing projects to migrate (incompatible with -gitlab-project and -github-repo)
+        specifies the path to a CSV file describing projects to migrate (incompatible with -project id and -github-repo) with the following columns: gitlab_project_id,github_repo_path. Example CSV:
+
+        123456,mygithubuser/myrepo
+        789012,mygithubuser/myotherrepo
   -rename-master-to-main
         rename master branch to main and update pull requests
   -usermap string
@@ -62,12 +75,12 @@ Written in Go, this is a cross-platform CLI utility that accepts the following r
 
 Use the `-github-user` argument to specify the GitHub username for whom the authentication token was issued (mandatory). You can also specify this with the `GITHUB_USER` environment variable.
 
-You can specify an individual GitLab project with the `-gitlab-project` argument, along with the target GitHub repository with the `-github-repo` argument.
+You can specify an individual GitLab project with the `-project-id` argument, along with the target GitHub repository with the `-github-repo` argument.
 
 Alternatively, you can supply the path to a CSV file with the `-projects-csv` argument, which should contain two columns:
 
 ```csv
-gitlab-group/gitlab-project-name,github-org-or-user/github-repo-name
+gitlab-project-id,github-org-or-user/github-repo-name
 ```
 
 For authentication, the `GITLAB_TOKEN` and `GITHUB_TOKEN` environment variables must be populated. You cannot specify tokens as command-line arguments.
@@ -76,7 +89,7 @@ To enable migration of GitLab merge requests to GitHub pull requests (including 
 
 To delete existing GitHub repos prior to migrating, pass the `-delete-existing-repos` argument. _This is potentially dangerous, you won't be asked for confirmation._
 
-Note: If the destination repository does not exist, this tool will attempt to create a private repository. If the destination repo already exists, it will be used unless you specify `-delete-existing-repos`
+**NOTE**: If the destination repository does not exist, this tool will attempt to create a private repository. If the destination repo already exists, it will be used unless you specify `-delete-existing-repos`
 
 Specify the location of a self-hosted instance of GitLab with the `-gitlab-domain` argument, or a GitHub Enterprise instance with the `-github-domain` argument.
 
@@ -86,7 +99,7 @@ By default, 4 workers will be spawned to migrate up to 4 projects in parallel. Y
 
 Specify `-loop` to continue migrating projects until canceled. This is useful for daemonizing the migration tool, or automatically restarting when migrating a large number of projects (or a small number of very large projects).
 
-To map GitLab usernames to GitHub usernames (for correct authorship in migrated PRs and comments), use the `-usermap` flag with a CSV file containing pairs of GitLab and GitHub usernames. If a GitLab user is not found, the tool will check this mapping before falling back to a generic "ghost" user. This helps preserve authorship and attribution during migration.
+To map GitLab usernames to GitHub usernames (for correct authorship in migrated PRs and comments), use the `-usermap` flag with a CSV file containing pairs of GitLab and GitHub usernames. If a GitLab user is not found (has been deleted from GitLab), the tool will mark it as `Deleted User`, but if user mapping is provided, it will assign GitHub username to this user. This helps preserve authorship and attribution during migration.
 
 ## Logging
 
@@ -96,10 +109,10 @@ This tool is entirely noninteractive and outputs different levels of logs depend
 
 The tool maintains a thread-safe in-memory cache for certain primitives, in order to help reduce the number of API requests being made. At this time, the following are cached the first time they are encountered, and thereafter retrieved from the cache until the tool is restarted:
 
-- GitHub pull requests
-- GitHub issue search results
-- GitHub user profiles
-- GitLab user profiles
+- GitHub pull requests,
+- GitHub issue search results,
+- GitHub user profiles,
+- GitLab user profiles.
 
 ## Idempotence
 
@@ -115,17 +128,19 @@ Whilst the git repository will be migrated verbatim, the pull requests are manag
 
 Each pull request, along with every comment, will be prepended with a Markdown table showing the original author and some other metadata that is useful to know.  This is also used to map pull requests and their comments to their counterparts in GitLab and enables the tool to be idempotent.
 
-As a bonus, if your GitLab users add the URL to their GitHub profile in the `Website` field of their GitLab profile, this tool will add a link to their GitHub profile in the markdown header of any PR or comment they originally authored.
-
 This tool also migrates merged/closed merge requests from your GitLab projects. It does this by reconstructing temporary branches in each repo, pushing them to GitHub, creating then closing the pull request, and lastly deleting the temporary branches. Once the tool has completed, you should not have any of these temporary branches in your repo - although GitHub will not garbage collect them immediately such that you can click the `Restore branch` button in any of these PRs.
 
 _Example migrated pull request (open)_
 
-![example migrated open pull request](pr-example-open.jpeg)
+![example migrated open pull request](img/pr-example-open.png)
+
+_Example migrated pull request (merged)_
+
+![example migrated open pull request](img/pr-example-merged.png)
 
 _Example migrated pull request (closed)_
 
-![example migrated closed pull request](pr-example-closed.jpeg)
+![example migrated closed pull request](img/pr-example-closed.png)
 
 ## Contributing, reporting bugs etc...
 

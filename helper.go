@@ -99,7 +99,7 @@ func getGitlabUser(username string) (*gitlab.User, error) {
 			}
 		}
 
-		// If no existing user found, check if there's a mapping to create a new user
+		// If no existing user found, check if there's a mapping assign a "Deleted User" with GitHub username
 		if gh_username, ok := userMap[username]; ok {
 			user := &gitlab.User{
 				Username: username,
@@ -109,6 +109,7 @@ func getGitlabUser(username string) (*gitlab.User, error) {
 			return user, nil
 		}
 
+		// If no user found and no mapping provied, create a default "Deleted User"
 		user := &gitlab.User{
 			Username: username,
 			Name:     "Deleted User",

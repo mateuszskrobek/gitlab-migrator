@@ -126,7 +126,7 @@ func main() {
 	flag.StringVar(&githubRepo, "github-repo", "", "the GitHub repository to migrate to")
 	flag.StringVar(&githubUser, "github-user", "", "specifies the GitHub user to use, who will author any migrated PRs (required)")
 	flag.StringVar(&gitlabDomain, "gitlab-domain", defaultGitlabDomain, "specifies the GitLab domain to use")
-	flag.StringVar(&gitlabProjectId, "project-id", "", "GitLab project ID")
+	flag.StringVar(&gitlabProjectId, "project-id", "", "ID of the GitLab project to migrate")
 	flag.StringVar(&projectsCsvPath, "projects-csv", "", "specifies the path to a CSV file describing projects to migrate (incompatible with -project-id and -github-repo)")
 	flag.StringVar(&userMapFile, "usermap", "", "CSV file with gitlab,github username pairs")
 
@@ -467,7 +467,7 @@ func performMigration(ctx context.Context, projects []Project) error {
 	}
 
 	if loop {
-		logger.Info(fmt.Sprintf("looping migration until canceled"))
+		logger.Info("looping migration until canceled")
 		for {
 			if err := ctx.Err(); err != nil {
 				break
