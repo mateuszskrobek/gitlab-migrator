@@ -6,7 +6,7 @@ import (
 	"time"
 
 	"github.com/google/go-github/v69/github"
-	"github.com/xanzy/go-gitlab"
+	gitlab "gitlab.com/gitlab-org/api/client-go"
 )
 
 func getGithubPullRequest(ctx context.Context, org, repo string, prNumber int) (*github.PullRequest, error) {
@@ -87,6 +87,11 @@ func getGitlabUser(username string) (*gitlab.User, error) {
 
 		for _, user = range users {
 			if user != nil && user.Username == username {
+				// Check if there's a mapping for this user
+				if gh_username, ok := userMap[username]; ok {
+					user.Name += " (@" + gh_username + ")"
+				}
+
 				logger.Trace("caching GitLab user", "username", username)
 				cache.setGitlabUser(username, *user)
 
@@ -94,7 +99,25 @@ func getGitlabUser(username string) (*gitlab.User, error) {
 			}
 		}
 
-		return nil, fmt.Errorf("GitLab user not found: %s", username)
+		// If no existing user found, check if there's a mapping assign a "Deleted User" with GitHub username
+		if gh_username, ok := userMap[username]; ok {
+			user := &gitlab.User{
+				Username: username,
+				Name:     "Deleted User (@" + gh_username + ")",
+			}
+			cache.setGitlabUser(username, *user)
+			return user, nil
+		}
+
+		// If no user found and no mapping provied, create a default "Deleted User"
+		user := &gitlab.User{
+			Username: username,
+			Name:     "Deleted User",
+		}
+
+		cache.setGitlabUser(username, *user)
+
+		return user, nil
 	}
 
 	return user, nil
